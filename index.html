@@ -1,0 +1,950 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Game</title>
+<style>
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0b1020;
+    touch-action: none;
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  /* 画面全体を覆い、iOS のノッチ/ホームバー領域を safe-area で避ける（CLAUDE.md 絶対規約） */
+  #stage {
+    position: fixed;
+    inset: 0;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="game" aria-label="ゲーム画面">
+    このブラウザは Canvas に対応していません。
+  </canvas>
+</div>
+<!--
+  RUNTIME_VERSION: このファイル + games/runtime/gamekit.js の組み合わせのバージョン。
+  apps/platform/src/gen/compose.ts の SUPPORTED_RUNTIME_VERSION と一致させる
+  （不一致は合成を拒否する = 保存済み HTML は不変というルールを守るため）。
+-->
+<script>var RUNTIME_VERSION = "rt-2";</script>
+<!--
+  GameKit と生成ロジックは別のスクリプト要素にする。ロジックが構文エラーでも
+  GameKit 側のエラー収集・診断チャネル確立は独立して機能する（docs/m2-design.md）。
+-->
+<script>
+// GameKit: プラットフォーム提供の固定ランタイム（依存ゼロ IIFE）。
+// AI 生成ロジックはこの window.GameKit 経由でのみ画面・入力・音を扱う
+// （docs/architecture.md 原則 4・docs/m2-design.md「固定ランタイム」）。
+//
+// 公開 API（apps/platform/src/gen/static-check.ts の許可リストと同期させること）:
+//   GameKit.run({ title, instructions, emoji, init, update(dt), draw(ctx), onTap, onDrag })
+//   GameKit.emoji(ctx, char, x, y, sizePx, color?)
+//   GameKit.text(ctx, str, x, y, { size, font, color, align, baseline }?)
+//   GameKit.score.add(n) / .set(n) / .get()
+//   GameKit.gameOver()
+//   GameKit.width() / GameKit.height()  … canvas の CSS ピクセルサイズ
+//   GameKit.sfx.play("tap" | "score" | "hit" | "clear")
+(function (global) {
+  'use strict';
+
+  // iOS Safari の Canvas は sans-serif から Apple Color Emoji へ自動フォールバックしない
+  // ため、絵文字を描く ctx.font には必ずこのスタックを使う（architecture.md 原則 4）。
+  var EMOJI_FONT_STACK = '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+
+  var STATE = Object.freeze({ TITLE: 'title', PLAYING: 'playing', GAMEOVER: 'gameover' });
+
+  var MAX_DELTA_TIME = 0.1; // タブ非アクティブ復帰時などの大ジャンプ防止(s)
+  var RETRY_BUTTON_WIDTH = 220;
+  var RETRY_BUTTON_HEIGHT = 64;
+  var RETRY_BUTTON_Y_RATIO = 0.62;
+  var MAX_REPORTED_ERRORS = 20; // 診断チャネルへの連投防止（同一フレームで例外が続くケース対策）
+  var MAX_PENDING_ERRORS = MAX_REPORTED_ERRORS;
+
+  // ==========================================================================
+  // 診断チャネル（共有インターフェース 7）
+  // 親 → iframe: window.postMessage({kind:"gamekit-init", versionId}, "*", [port2])
+  // iframe → 親: port.postMessage({kind:"gamekit-error"|"gamekit-ready", ...})
+  // ==========================================================================
+
+  var diagPort = null;
+  var diagVersionId = null;
+  var reportedErrorCount = 0;
+  var pendingErrors = []; // port 確立前に発生したエラーを溜めておき、確立後にまとめて送る
+  var runSucceeded = false;
+  var readySent = false;
+
+  function sendErrorPayload(payload) {
+    reportedErrorCount += 1;
+    try {
+      diagPort.postMessage(payload);
+    } catch (e) {
+      // port が閉じている等は握りつぶす（診断送信の失敗でゲーム進行を止めない）
+    }
+  }
+
+  function reportError(message, stack) {
+    if (reportedErrorCount >= MAX_REPORTED_ERRORS) {
+      return;
+    }
+    var payload = {
+      kind: 'gamekit-error',
+      versionId: diagVersionId,
+      message: String(message === null || message === undefined ? 'unknown error' : message),
+      stack: stack ? String(stack) : undefined
+    };
+    if (!diagPort) {
+      if (pendingErrors.length < MAX_PENDING_ERRORS) {
+        pendingErrors.push(payload);
+      }
+      return;
+    }
+    sendErrorPayload(payload);
+  }
+
+  function tryReportReady() {
+    if (readySent || !diagPort || !runSucceeded) {
+      return;
+    }
+    readySent = true;
+    try {
+      diagPort.postMessage({ kind: 'gamekit-ready', versionId: diagVersionId });
+    } catch (e) {}
+  }
+
+  // オペークオリジンでは event.origin が "null" になり送信元検証に使えないため、
+  // MessageChannel の port を専有すること自体を認証代わりにする（m2-design.md）。
+  // このリスナーは GameKit スクリプトが生成ロジックより先に読み込まれるため必ず先着し、
+  // stopImmediatePropagation で後続リスナー（生成ロジックが window に登録し得るもの）
+  // に同じイベント・同じ port を渡さない。
+  global.addEventListener('message', function (event) {
+    var data = event.data;
+    if (!data || data.kind !== 'gamekit-init') {
+      return;
+    }
+    event.stopImmediatePropagation();
+    diagVersionId = typeof data.versionId === 'string' ? data.versionId : null;
+    diagPort = (event.ports && event.ports[0]) || null;
+    if (!diagPort) {
+      return;
+    }
+    for (var i = 0; i < pendingErrors.length; i++) {
+      pendingErrors[i].versionId = diagVersionId;
+      sendErrorPayload(pendingErrors[i]);
+    }
+    pendingErrors = [];
+    tryReportReady();
+  });
+
+  global.addEventListener('error', function (event) {
+    reportError(event.message, event.error && event.error.stack);
+  });
+  global.addEventListener('unhandledrejection', function (event) {
+    var reason = event.reason;
+    reportError(reason && reason.message ? reason.message : String(reason), reason && reason.stack);
+  });
+
+  // ==========================================================================
+  // 内部状態（closure に隠蔽。生成ロジックは window.GameKit 経由でしか触れない）
+  // ==========================================================================
+
+  var config = null;
+  var started = false;
+  var state = STATE.TITLE;
+  var score = 0;
+  var canvas = null;
+  var ctx = null;
+  var cssWidth = 0;
+  var cssHeight = 0;
+  var pointerId = null;
+  var pointerActive = false;
+  var lastPointerX = 0;
+  var lastPointerY = 0;
+  var lastFrameTime = 0;
+  var audioCtx = null;
+
+  // ==========================================================================
+  // Canvas / DPR
+  // ==========================================================================
+
+  function resizeCanvas() {
+    if (!canvas) {
+      return;
+    }
+    var rect = canvas.getBoundingClientRect();
+    cssWidth = rect.width;
+    cssHeight = rect.height;
+    var dpr = global.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(cssWidth * dpr));
+    canvas.height = Math.max(1, Math.round(cssHeight * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function getRelativePos(e) {
+    var rect = canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  // ==========================================================================
+  // Audio（プロシージャル SE。AudioContext はタップ起点でのみ生成/resume する）
+  // ==========================================================================
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      var AudioContextClass = global.AudioContext || global.webkitAudioContext;
+      if (!AudioContextClass) {
+        return;
+      }
+      audioCtx = new AudioContextClass();
+    }
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume()['catch'](function () {});
+    }
+  }
+
+  function playToneAt(delay, freq, freqEnd, duration, type, volume) {
+    if (!audioCtx) {
+      return;
+    }
+    var start = audioCtx.currentTime + delay;
+    var osc = audioCtx.createOscillator();
+    var gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, start);
+    if (freqEnd !== undefined) {
+      osc.frequency.linearRampToValueAtTime(freqEnd, start + duration);
+    }
+    gain.gain.setValueAtTime(volume, start);
+    gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(start);
+    osc.stop(start + duration + 0.02);
+  }
+
+  var SFX = {
+    tap: function () { playToneAt(0, 660, 880, 0.08, 'sine', 0.2); },
+    score: function () { playToneAt(0, 880, 1320, 0.12, 'triangle', 0.22); },
+    hit: function () { playToneAt(0, 220, 60, 0.35, 'sawtooth', 0.3); },
+    clear: function () {
+      playToneAt(0, 660, 880, 0.12, 'triangle', 0.2);
+      playToneAt(0.1, 990, 1320, 0.16, 'triangle', 0.2);
+    }
+  };
+
+  function playSfx(name) {
+    var fn = SFX[name];
+    if (typeof fn === 'function') {
+      fn();
+    }
+  }
+
+  // ==========================================================================
+  // 状態機械・入力
+  // ==========================================================================
+
+  function safeCall(fn, args, label) {
+    if (typeof fn !== 'function') {
+      return undefined;
+    }
+    try {
+      return fn.apply(null, args);
+    } catch (err) {
+      reportError(label + ': ' + (err && err.message ? err.message : String(err)), err && err.stack);
+      return undefined;
+    }
+  }
+
+  function safeDraw() {
+    // draw は生成ロジックが ctx の状態（fillStyle 等）を変更し得るため、
+    // GameKit 自身の HUD/タイトル/リザルト描画に影響しないよう save/restore で境界を切る。
+    ctx.save();
+    try {
+      if (typeof config.draw === 'function') {
+        config.draw(ctx);
+      }
+    } catch (err) {
+      reportError('draw: ' + (err && err.message ? err.message : String(err)), err && err.stack);
+    } finally {
+      ctx.restore();
+    }
+  }
+
+  function beginSession() {
+    score = 0;
+    pointerActive = false;
+    pointerId = null;
+    safeCall(config.init, [], 'init');
+  }
+
+  function startGame() {
+    beginSession();
+    state = STATE.PLAYING;
+    playSfx('tap');
+  }
+
+  function triggerGameOver() {
+    state = STATE.GAMEOVER;
+    pointerActive = false;
+    playSfx('hit');
+  }
+
+  function getRetryButtonRect() {
+    return {
+      x: cssWidth / 2 - RETRY_BUTTON_WIDTH / 2,
+      y: cssHeight * RETRY_BUTTON_Y_RATIO,
+      width: RETRY_BUTTON_WIDTH,
+      height: RETRY_BUTTON_HEIGHT
+    };
+  }
+
+  function isInsideRect(x, y, rect) {
+    return x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height;
+  }
+
+  function onPointerDown(e) {
+    if (e.button !== undefined && e.button > 0) {
+      return; // 右クリック等は無視
+    }
+    e.preventDefault();
+    var pos = getRelativePos(e);
+
+    if (state === STATE.TITLE) {
+      ensureAudio(); // 「タップしてスタート」ゲート: 初回タップ内で生成/resume する
+      startGame();
+      return;
+    }
+    if (state === STATE.GAMEOVER) {
+      if (isInsideRect(pos.x, pos.y, getRetryButtonRect())) {
+        ensureAudio();
+        startGame();
+      }
+      return;
+    }
+
+    // PLAYING: ドラッグ開始点として記録しつつ、離散的な「タップ」としても通知する。
+    pointerActive = true;
+    pointerId = e.pointerId;
+    lastPointerX = pos.x;
+    lastPointerY = pos.y;
+    if (canvas.setPointerCapture) {
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch (err) {
+        // 一部ブラウザで無効な pointerId の場合は無視して続行
+      }
+    }
+    safeCall(config.onTap, [{ x: pos.x, y: pos.y }], 'onTap');
+  }
+
+  function onPointerMove(e) {
+    if (state !== STATE.PLAYING || !pointerActive || e.pointerId !== pointerId) {
+      return;
+    }
+    e.preventDefault();
+    var pos = getRelativePos(e);
+    var dx = pos.x - lastPointerX;
+    var dy = pos.y - lastPointerY;
+    lastPointerX = pos.x;
+    lastPointerY = pos.y;
+    safeCall(config.onDrag, [{ x: pos.x, y: pos.y, dx: dx, dy: dy }], 'onDrag');
+  }
+
+  function onPointerUp(e) {
+    if (e.pointerId === pointerId) {
+      pointerActive = false;
+      pointerId = null;
+    }
+  }
+
+  // ==========================================================================
+  // 描画: GameKit 共通 UI（タイトル / HUD / ゲームオーバー・リトライ）
+  // ==========================================================================
+
+  // タイトル背景と同じダーク系単色。frame() が毎フレーム最初にこれで全面クリアしてから
+  // 各状態の描画を呼ぶため、タイトル画面の描画自体はもう背景を塗る必要がない
+  // （塗ると二重に塗るだけで無害だが、クリア責務を frame() 側に一本化して漏れを防ぐ）。
+  var BACKGROUND_COLOR = '#101833';
+
+  function clearCanvas() {
+    ctx.fillStyle = BACKGROUND_COLOR;
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+  }
+
+  function drawTitleScreen() {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    if (config.emoji) {
+      drawEmoji(ctx, config.emoji, cssWidth / 2, cssHeight * 0.38, 56);
+    }
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 30px sans-serif';
+    ctx.fillText(config.title || 'ゲーム', cssWidth / 2, cssHeight * 0.56);
+
+    if (config.instructions) {
+      ctx.font = '16px sans-serif';
+      ctx.fillText(config.instructions, cssWidth / 2, cssHeight * 0.66);
+    }
+
+    ctx.font = '22px sans-serif';
+    ctx.fillText('タップしてスタート', cssWidth / 2, cssHeight * 0.78);
+  }
+
+  function drawHud() {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '20px sans-serif';
+    ctx.fillText('スコア: ' + Math.floor(score), 16, 16);
+  }
+
+  function drawRoundedRect(x, y, width, height, radius) {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.arcTo(x + width, y, x + width, y + height, radius);
+    ctx.arcTo(x + width, y + height, x, y + height, radius);
+    ctx.arcTo(x, y + height, x, y, radius);
+    ctx.arcTo(x, y, x + width, y, radius);
+    ctx.closePath();
+  }
+
+  function drawGameOverOverlay() {
+    ctx.fillStyle = 'rgba(8, 10, 24, 0.72)';
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 32px sans-serif';
+    ctx.fillText('ゲームオーバー', cssWidth / 2, cssHeight * 0.34);
+
+    ctx.font = '24px sans-serif';
+    ctx.fillText('スコア: ' + Math.floor(score), cssWidth / 2, cssHeight * 0.44);
+
+    var rect = getRetryButtonRect();
+    ctx.fillStyle = '#ff6b6b';
+    drawRoundedRect(rect.x, rect.y, rect.width, rect.height, 16);
+    ctx.fill();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 24px sans-serif';
+    ctx.fillText('もういちど', cssWidth / 2, rect.y + rect.height / 2);
+  }
+
+  // ==========================================================================
+  // メインループ
+  // ==========================================================================
+
+  function frame(timestamp) {
+    if (!lastFrameTime) {
+      lastFrameTime = timestamp;
+    }
+    var dt = Math.min(MAX_DELTA_TIME, (timestamp - lastFrameTime) / 1000);
+    lastFrameTime = timestamp;
+
+    if (state === STATE.PLAYING) {
+      safeCall(config.update, [dt], 'update');
+    }
+
+    // 生成ロジックの draw を呼ぶ前に必ず全面クリアする。クリアしないと前フレームの
+    // タイトル画面・移動物の軌跡・ゲームオーバーの半透明オーバーレイが重なって
+    // 残り続ける（外部レビュー P2-9）。
+    clearCanvas();
+
+    if (state === STATE.TITLE) {
+      drawTitleScreen();
+    } else if (state === STATE.PLAYING) {
+      safeDraw();
+      drawHud();
+    } else if (state === STATE.GAMEOVER) {
+      safeDraw();
+      drawGameOverOverlay();
+    }
+
+    global.requestAnimationFrame(frame);
+  }
+
+  // ==========================================================================
+  // 公開 API
+  // ==========================================================================
+
+  function validateConfig(cfg) {
+    var required = ['init', 'update', 'draw'];
+    for (var i = 0; i < required.length; i++) {
+      if (typeof cfg[required[i]] !== 'function') {
+        reportError('GameKit.run: "' + required[i] + '" は関数である必要があります');
+      }
+    }
+  }
+
+  function run(cfg) {
+    if (started) {
+      reportError('GameKit.run: 既に開始済みです（二重呼び出し）');
+      return;
+    }
+    started = true;
+    config = cfg || {};
+    validateConfig(config);
+
+    canvas = global.document.getElementById('game');
+    if (!canvas) {
+      reportError('GameKit.run: #game canvas が見つかりません');
+      return;
+    }
+    ctx = canvas.getContext('2d');
+    if (!ctx) {
+      reportError('GameKit.run: 2D コンテキストを取得できません');
+      return;
+    }
+
+    resizeCanvas();
+    global.addEventListener('resize', resizeCanvas);
+    global.addEventListener('orientationchange', function () {
+      // iOS は回転直後に viewport 寸法が確定していないことがあるため少し待つ
+      setTimeout(resizeCanvas, 150);
+    });
+    if (global.visualViewport) {
+      global.visualViewport.addEventListener('resize', resizeCanvas);
+    }
+
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointercancel', onPointerUp);
+    canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+    global.requestAnimationFrame(frame);
+
+    runSucceeded = true;
+    tryReportReady();
+  }
+
+  function resolveDrawColor(targetCtx, color) {
+    if (typeof color === 'string') {
+      return color;
+    }
+    // fillStyle にグラデーション/パターンが残ったまま絵文字を描くと iOS Safari で
+    // 描画されない/背景に同化する実害があるため、単色でなければ既定色に落とす
+    // （architecture.md 原則 4）。
+    return typeof targetCtx.fillStyle === 'string' ? targetCtx.fillStyle : '#ffffff';
+  }
+
+  function drawEmoji(targetCtx, char, x, y, size, color) {
+    var c = targetCtx || ctx;
+    c.save();
+    c.font = size + 'px ' + EMOJI_FONT_STACK;
+    c.fillStyle = resolveDrawColor(c, color);
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillText(char, x, y);
+    c.restore();
+  }
+
+  function drawText(targetCtx, str, x, y, options) {
+    var c = targetCtx || ctx;
+    options = options || {};
+    c.save();
+    var size = options.size || 16;
+    c.font = options.font || (size + 'px sans-serif');
+    c.fillStyle = resolveDrawColor(c, options.color);
+    c.textAlign = options.align || 'center';
+    c.textBaseline = options.baseline || 'middle';
+    c.fillText(str, x, y);
+    c.restore();
+  }
+
+  function scoreAdd(n) {
+    if (typeof n === 'number' && isFinite(n)) {
+      score += n;
+    }
+  }
+  function scoreSet(n) {
+    score = (typeof n === 'number' && isFinite(n)) ? n : 0;
+  }
+  function scoreGet() {
+    return score;
+  }
+
+  function gameOver() {
+    if (state === STATE.PLAYING) {
+      triggerGameOver();
+    }
+  }
+
+  function width() { return cssWidth; }
+  function height() { return cssHeight; }
+
+  var GameKit = {
+    run: run,
+    emoji: drawEmoji,
+    text: drawText,
+    score: { add: scoreAdd, set: scoreSet, get: scoreGet },
+    gameOver: gameOver,
+    width: width,
+    height: height,
+    sfx: { play: playSfx }
+  };
+
+  Object.freeze(GameKit.score);
+  Object.freeze(GameKit.sfx);
+  Object.freeze(GameKit);
+
+  // window.GameKit を書き込み不可・再定義不可にする。Object.freeze(GameKit) は
+  // オブジェクト自身のプロパティしか保護しないため、これが無いと生成ロジックが
+  // `GameKit = {...}` で参照ごとすり替えられ、上の防御が無意味になる。
+  Object.defineProperty(global, 'GameKit', {
+    value: GameKit,
+    writable: false,
+    configurable: false,
+    enumerable: true
+  });
+})(window);
+
+</script>
+<script>
+let W = 0, H = 0, groundY = 0;
+let player;
+let obstacles;
+let coins;
+let clouds;
+let dust;
+let speed, baseSpeed, maxSpeed;
+let spawnDist, nextGap;
+let coinDist, nextCoinGap;
+let elapsed, dustTimer, stripeOffset;
+
+const PLAYER_EMOJI = "🐱";
+const OB_EMOJIS = ["🌵", "🪨", "🔥"];
+const COIN_EMOJI = "🪙";
+
+function measure() {
+  W = GameKit.width();
+  H = GameKit.height();
+  groundY = H * 0.78;
+}
+
+function jumpV() { return -H * 1.5; }
+function gravity() { return H * 4.5; }
+
+function spawnObstacle() {
+  const size = Math.max(34, Math.min(78, H * (0.055 + Math.random() * 0.035)));
+  const emoji = OB_EMOJIS[(Math.random() * OB_EMOJIS.length) | 0];
+  obstacles.push({ x: W + size, y: groundY - size / 2, size: size, emoji: emoji, passed: false });
+  const t = 0.65 + Math.random() * 0.55;
+  nextGap = speed * t + size;
+}
+
+function spawnCoinPattern() {
+  const cs = Math.max(24, Math.min(34, H * 0.04));
+  const kind = (Math.random() * 3) | 0;
+  const positions = [];
+  let i;
+  if (kind === 0) {
+    for (i = 0; i < 4; i++) positions.push({ dx: i * 46, h: 28 });
+  } else if (kind === 1) {
+    const hs = [0.10, 0.20, 0.26, 0.20, 0.10];
+    for (i = 0; i < 5; i++) positions.push({ dx: i * 46, h: H * hs[i] });
+  } else {
+    for (i = 0; i < 3; i++) positions.push({ dx: i * 46, h: H * 0.42 });
+  }
+  const x0 = W + 40;
+  for (i = 0; i < positions.length; i++) {
+    coins.push({
+      x: x0 + positions[i].dx,
+      hAbove: positions[i].h,
+      y: 0,
+      size: cs,
+      phase: Math.random() * 6.28,
+      taken: false
+    });
+  }
+  nextCoinGap = speed * (1.1 + Math.random() * 1.3) + positions.length * 46;
+}
+
+function spawnDust(n) {
+  for (let i = 0; i < n; i++) {
+    dust.push({
+      x: player.x - player.size * 0.35 + (Math.random() - 0.5) * 8,
+      y: groundY - 4,
+      vx: -40 - Math.random() * 70,
+      vy: -30 - Math.random() * 50,
+      r: 2.5 + Math.random() * 3,
+      life: 0.35,
+      maxLife: 0.35,
+      color: "#CBB79A"
+    });
+  }
+}
+
+function spawnPuff() {
+  for (let i = 0; i < 10; i++) {
+    const a = (Math.PI * 2 * i) / 10;
+    dust.push({
+      x: player.x,
+      y: player.y + player.size * 0.4,
+      vx: Math.cos(a) * (60 + Math.random() * 70),
+      vy: Math.sin(a) * (50 + Math.random() * 50) * 0.6 + 50,
+      r: 2.5 + Math.random() * 2.5,
+      life: 0.3,
+      maxLife: 0.3,
+      color: "#FFFFFF"
+    });
+  }
+}
+
+function spawnSparkle(x, y) {
+  for (let i = 0; i < 8; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 60 + Math.random() * 90;
+    dust.push({
+      x: x,
+      y: y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp - 30,
+      r: 2 + Math.random() * 2.5,
+      life: 0.35,
+      maxLife: 0.35,
+      color: "#FFD54A"
+    });
+  }
+}
+
+GameKit.run({
+  title: "タップでジャンプ！ネコラン",
+  instructions: "タップでジャンプ！2段ジャンプもできるよ。コインを取ってスコアアップ！",
+  emoji: "🐱",
+
+  init: function () {
+    measure();
+    const psize = Math.max(38, Math.min(64, H * 0.08));
+    player = { x: W * 0.22, y: groundY - psize / 2, size: psize, vy: 0, jumps: 0, grounded: true };
+    obstacles = [];
+    coins = [];
+    dust = [];
+    clouds = [];
+    for (let i = 0; i < 4; i++) {
+      clouds.push({
+        x: Math.random() * W,
+        y: H * (0.06 + Math.random() * 0.25),
+        size: 30 + Math.random() * 34
+      });
+    }
+    baseSpeed = W * 0.5;
+    maxSpeed = W * 1.05;
+    speed = baseSpeed;
+    spawnDist = 0;
+    nextGap = W * 0.75;
+    coinDist = 0;
+    nextCoinGap = W * 0.9;
+    elapsed = 0;
+    dustTimer = 0;
+    stripeOffset = 0;
+  },
+
+  update: function (dt) {
+    measure();
+    elapsed += dt;
+    speed = Math.min(maxSpeed, baseSpeed + elapsed * W * 0.012);
+
+    player.vy += gravity() * dt;
+    player.y += player.vy * dt;
+    const floorY = groundY - player.size / 2;
+    if (player.y >= floorY) {
+      if (!player.grounded && player.vy > H * 0.6) spawnDust(6);
+      player.y = floorY;
+      player.vy = 0;
+      player.grounded = true;
+      player.jumps = 0;
+    } else {
+      player.grounded = false;
+    }
+
+    if (player.grounded) {
+      dustTimer -= dt;
+      if (dustTimer <= 0) { dustTimer = 0.14; spawnDust(1); }
+    }
+
+    const dx = speed * dt;
+    stripeOffset += dx;
+
+    spawnDist += dx;
+    if (spawnDist >= nextGap) {
+      spawnDist = 0;
+      spawnObstacle();
+    }
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      o.x -= dx;
+      o.y = groundY - o.size / 2;
+      if (!o.passed && o.x + o.size * 0.5 < player.x - player.size * 0.5) {
+        o.passed = true;
+        GameKit.score.add(1);
+        GameKit.sfx.play("score");
+      }
+    }
+    obstacles = obstacles.filter(function (o) { return o.x > -o.size * 2; });
+
+    coinDist += dx;
+    if (coinDist >= nextCoinGap) {
+      coinDist = 0;
+      spawnCoinPattern();
+    }
+    for (let i = 0; i < coins.length; i++) {
+      const c = coins[i];
+      c.x -= dx;
+      c.y = groundY - c.hAbove;
+      if (!c.taken) {
+        const cdx = c.x - player.x, cdy = c.y - player.y;
+        const crr = player.size * 0.45 + c.size * 0.5;
+        if (cdx * cdx + cdy * cdy < crr * crr) {
+          c.taken = true;
+          GameKit.score.add(1);
+          GameKit.sfx.play("score");
+          spawnSparkle(c.x, c.y);
+        }
+      }
+    }
+    coins = coins.filter(function (c) { return !c.taken && c.x > -40; });
+
+    const pr = player.size * 0.34;
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      const rr = pr + o.size * 0.34;
+      const ddx = o.x - player.x, ddy = o.y - player.y;
+      if (ddx * ddx + ddy * ddy < rr * rr) {
+        GameKit.sfx.play("hit");
+        GameKit.gameOver();
+        return;
+      }
+    }
+
+    for (let i = 0; i < clouds.length; i++) {
+      const c = clouds[i];
+      c.x -= speed * 0.08 * dt;
+      if (c.x < -60) { c.x = W + 60; c.y = H * (0.06 + Math.random() * 0.25); }
+    }
+
+    for (let i = 0; i < dust.length; i++) {
+      const p = dust[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 500 * dt;
+      p.life -= dt;
+    }
+    dust = dust.filter(function (p) { return p.life > 0; });
+  },
+
+  draw: function (ctx) {
+    measure();
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#7EC8FF");
+    g.addColorStop(0.75, "#DFF4FF");
+    g.addColorStop(1, "#FFF7E0");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    GameKit.emoji(ctx, "☀️", W * 0.85, H * 0.12, 42);
+    for (let i = 0; i < clouds.length; i++) {
+      const c = clouds[i];
+      GameKit.emoji(ctx, "☁️", c.x, c.y, c.size);
+    }
+
+    ctx.fillStyle = "#8B5E34";
+    ctx.fillRect(0, groundY, W, H - groundY);
+    ctx.fillStyle = "#63C74D";
+    ctx.fillRect(0, groundY, W, Math.max(8, H * 0.012));
+
+    ctx.fillStyle = "rgba(0,0,0,0.10)";
+    const step = 92, sw = 44;
+    const off = stripeOffset % step;
+    const sy = groundY + (H - groundY) * 0.45;
+    for (let x = -off; x < W + step; x += step) {
+      ctx.fillRect(x, sy, sw, Math.max(6, H * 0.01));
+    }
+
+    for (let i = 0; i < dust.length; i++) {
+      const p = dust[i];
+      ctx.globalAlpha = Math.max(0, p.life / p.maxLife) * 0.6;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    for (let i = 0; i < coins.length; i++) {
+      const c = coins[i];
+      const bob = Math.sin(elapsed * 6 + c.phase) * 3;
+      GameKit.emoji(ctx, COIN_EMOJI, c.x, c.y + bob, c.size);
+    }
+
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      GameKit.emoji(ctx, o.emoji, o.x, o.y, o.size);
+    }
+
+    const tilt = Math.max(-1, Math.min(1, player.vy / (H * 1.5))) * 0.3;
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.rotate(tilt);
+    GameKit.emoji(ctx, PLAYER_EMOJI, 0, 0, player.size);
+    ctx.restore();
+
+    if (!player.grounded && player.jumps < 2) {
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.strokeStyle = "rgba(0,0,0,0.25)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(player.x, player.y - player.size * 0.85, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+  },
+
+  onTap: function () {
+    if (player.grounded) {
+      player.vy = jumpV();
+      player.jumps = 1;
+      player.grounded = false;
+      GameKit.sfx.play("tap");
+      spawnDust(5);
+    } else if (player.jumps < 2) {
+      player.vy = jumpV();
+      player.jumps = 2;
+      GameKit.sfx.play("tap");
+      spawnPuff();
+    }
+  }
+});
+</script>
+</body>
+</html>
